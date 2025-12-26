@@ -1,27 +1,72 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Terminal, Cpu, ShieldCheck, Clock, RefreshCcw, User } from 'lucide-react';
 
+// Environment-aware config
 const JARVIS_CONFIG = {
-  WEBHOOK_URL: 'http://localhost:5678/webhook/javispro212', // Replace with your actual n8n endpoint
+  WEBHOOK_URL: import.meta.env.VITE_WEBHOOK_URL || 'http://localhost:5678/webhook-test/javispro212',
   INITIAL_GREETING: "System online. How may I assist you today, sir?",
   ERROR_MESSAGE: "JARVIS is temporarily unavailable. Attempting to reconnect...",
+  RETRY_DELAY: 5000,
+  REQUEST_TIMEOUT: 30000,
 };
+
+// Error boundary component
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, errorInfo) {
+    console.error('React Error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex items-center justify-center h-screen bg-[#05070a] text-red-400">
+          <div className="text-center">
+            <p className="text-lg font-bold">System Error</p>
+            <p className="text-sm text-gray-500">{this.state.error?.message}</p>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const App = () => {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [userId] = useState(() => `USR-${Math.random().toString(36).substr(2, 9).toUpperCase()}`);
+  const [userId] = useState(() => `USR-${Math.random().toString(36).substring(2, 11).toUpperCase()}`);
   const [status, setStatus] = useState('Online');
-  
+  const retryTimeoutRef = useRef(null);
+
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
 
+  // Safe localStorage parsing with error handling
+  const safeLoadHistory = useCallback(() => {
+    try {
+      const saved = localStorage.getItem('jarvis_history');
+      return saved ? JSON.parse(saved) : null;
+    } catch (error) {
+      console.error('Failed to load chat history:', error);
+      return null;
+    }
+  }, []);
+
   // Initialize Chat
   useEffect(() => {
-    const savedHistory = localStorage.getItem('jarvis_history');
-    if (savedHistory) {
-      setMessages(JSON.parse(savedHistory));
+    const savedHistory = safeLoadHistory();
+    if (savedHistory?.length > 0) {
+      setMessages(savedHistory);
     } else {
       setMessages([{
         id: Date.now(),
@@ -31,21 +76,26 @@ const App = () => {
       }]);
     }
     inputRef.current?.focus();
-  }, []);
+  }, [safeLoadHistory]);
 
-  // Persist History
+  // Persist History with limit (last 100 messages)
   useEffect(() => {
     if (messages.length > 0) {
-      localStorage.setItem('jarvis_history', JSON.stringify(messages));
+      try {
+        const recentMessages = messages.slice(-100);
+        localStorage.setItem('jarvis_history', JSON.stringify(recentMessages));
+      } catch (error) {
+        console.error('Failed to save chat history:', error);
+      }
     }
     scrollToBottom();
   }, [messages]);
 
-  const scrollToBottom = () => {
+  const scrollToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
+  }, []);
 
-  const handleSend = async (e) => {
+  const handleSend = useCallback(async (e) => {
     e?.preventDefault();
     if (!input.trim() || isLoading) return;
 
@@ -62,28 +112,40 @@ const App = () => {
     setIsLoading(true);
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), JARVIS_CONFIG.REQUEST_TIMEOUT);
+
       const response = await fetch(JARVIS_CONFIG.WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: currentInput,
-          user_id: userId
-        })
+        body: JSON.stringify({ message: currentInput, user_id: userId }),
+        signal: controller.signal,
       });
 
-      if (!response.ok) throw new Error('Network failure');
-      
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+
       const data = await response.json();
-      
+
+      if (!data.reply) {
+        throw new Error('No reply from webhook');
+      }
+
       const jarvisReply = {
         id: Date.now() + 1,
         role: 'jarvis',
-        text: data.reply || "Task completed as requested.",
+        text: data.reply,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
 
       setMessages(prev => [...prev, jarvisReply]);
+      setStatus('Online');
     } catch (error) {
+      console.error('Webhook error:', error.message);
+
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         role: 'jarvis',
@@ -91,24 +153,48 @@ const App = () => {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         isError: true
       }]);
+
       setStatus('Offline');
-      setTimeout(() => setStatus('Online'), 5000);
+
+      // Clear previous timeout
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+
+      // Retry after delay
+      retryTimeoutRef.current = setTimeout(
+        () => setStatus('Online'),
+        JARVIS_CONFIG.RETRY_DELAY
+      );
     } finally {
       setIsLoading(false);
     }
-  };
+  }, [input, isLoading, userId]);
 
-  const clearHistory = () => {
+  const clearHistory = useCallback(() => {
     if (window.confirm("Purge local memory logs?")) {
-      localStorage.removeItem('jarvis_history');
-      setMessages([{
-        id: Date.now(),
-        role: 'jarvis',
-        text: "Memory purged. System reset.",
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      }]);
+      try {
+        localStorage.removeItem('jarvis_history');
+        setMessages([{
+          id: Date.now(),
+          role: 'jarvis',
+          text: "Memory purged. System reset.",
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+        }]);
+      } catch (error) {
+        console.error('Failed to clear history:', error);
+      }
     }
-  };
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div className="flex flex-col h-screen bg-[#05070a] text-slate-300 font-sans selection:bg-cyan-500/30">
@@ -200,7 +286,7 @@ const App = () => {
             onSubmit={handleSend}
             className="relative flex items-center group"
           >
-            <div className="absolute left-4 text-cyan-600 group-focus-within:text-cyan-400 transition-colors">
+            <div className="absolute left-4 text-cyan-600 group-focus-within:text-cyan-400 transition-colors pointer-events-none">
               <Terminal className="w-5 h-5" />
             </div>
             
@@ -211,6 +297,7 @@ const App = () => {
               onChange={(e) => setInput(e.target.value)}
               placeholder={isLoading ? "Processing sequence..." : "Execute command (e.g., 'plan my day')..."}
               disabled={isLoading}
+              aria-label="Message input"
               className={`
                 w-full bg-[#0d121d]/80 border border-slate-800 rounded-2xl py-4 pl-12 pr-16 
                 text-sm tracking-wide text-slate-100 placeholder:text-slate-600
@@ -223,6 +310,7 @@ const App = () => {
             <button
               type="submit"
               disabled={!input.trim() || isLoading}
+              aria-label="Send message"
               className={`
                 absolute right-3 p-2.5 rounded-xl transition-all duration-300
                 ${input.trim() && !isLoading 
@@ -241,6 +329,7 @@ const App = () => {
             </div>
             <button 
               onClick={clearHistory}
+              aria-label="Clear chat history"
               className="flex items-center gap-1.5 text-[9px] text-slate-600 uppercase tracking-widest font-bold hover:text-cyan-500 transition-colors"
             >
               <RefreshCcw className="w-2.5 h-2.5" />
@@ -249,24 +338,15 @@ const App = () => {
           </div>
         </div>
       </footer>
-
-      <style dangerouslySetInnerHTML={{ __html: `
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 4px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: #1e293b;
-          border-radius: 10px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
-          background: #0891b2;
-        }
-      `}} />
     </div>
   );
 };
 
-export default App;
+// Export wrapped component
+export default function WrappedApp() {
+  return (
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  );
+}
