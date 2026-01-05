@@ -1,72 +1,137 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Terminal, Cpu, ShieldCheck, Clock, RefreshCcw, User } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Send, Terminal, Cpu, ShieldCheck, Clock, RefreshCcw, User, Mic, StopCircle, Activity } from 'lucide-react';
 
-// Environment-aware config
 const JARVIS_CONFIG = {
-  WEBHOOK_URL: import.meta.env.VITE_WEBHOOK_URL || 'http://localhost:5678/webhook-test/javispro212',
-  INITIAL_GREETING: "System online. How may I assist you today, sir?",
-  ERROR_MESSAGE: "JARVIS is temporarily unavailable. Attempting to reconnect...",
-  RETRY_DELAY: 5000,
-  REQUEST_TIMEOUT: 30000,
+  WEBHOOK_URL: import.meta.env.VITE_WEBHOOK_URL || 'http://localhost:5678/webhook/javispro212',
+  INITIAL_GREETING: "System online. Listening for commands.",
+  ERROR_MESSAGE: "JARVIS is temporarily unavailable.",
+  VOICE_LANG: 'en-US',
+  AUTO_LISTEN_DELAY: 1500,
 };
 
-// Error boundary component
-class ErrorBoundary extends React.Component {
-  constructor(props) {
-    super(props);
-    this.state = { hasError: false, error: null };
-  }
-
-  static getDerivedStateFromError(error) {
-    return { hasError: true, error };
-  }
-
-  componentDidCatch(error, errorInfo) {
-    console.error('React Error:', error, errorInfo);
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="flex items-center justify-center h-screen bg-[#05070a] text-red-400">
-          <div className="text-center">
-            <p className="text-lg font-bold">System Error</p>
-            <p className="text-sm text-gray-500">{this.state.error?.message}</p>
-          </div>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
-
 const App = () => {
+  // --- State ---
+  const [userId] = useState(() => {
+    const savedId = localStorage.getItem('jarvis_user_id');
+    if (savedId) return savedId;
+    const newId = `USR-${Math.random().toString(36).slice(2, 11).toUpperCase()}`;
+    localStorage.setItem('jarvis_user_id', newId);
+    return newId;
+  });
+
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [userId] = useState(() => `USR-${Math.random().toString(36).substring(2, 11).toUpperCase()}`);
   const [status, setStatus] = useState('Online');
-  const retryTimeoutRef = useRef(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isListening, setIsListening] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
 
+  // --- Refs ---
   const chatEndRef = useRef(null);
   const inputRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const synthesisRef = useRef(window.speechSynthesis);
+  const voiceParams = useRef(null); // Store preferred voice
 
-  // Safe localStorage parsing with error handling
-  const safeLoadHistory = useCallback(() => {
-    try {
-      const saved = localStorage.getItem('jarvis_history');
-      return saved ? JSON.parse(saved) : null;
-    } catch (error) {
-      console.error('Failed to load chat history:', error);
-      return null;
+  // --- Helpers ---
+  const scrollToBottom = () => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+
+  const stopSpeaking = () => {
+    if (synthesisRef.current.speaking) {
+      synthesisRef.current.cancel();
     }
+    setIsSpeaking(false);
+  };
+
+  const startListening = () => {
+    if (recognitionRef.current && !isListening) {
+      try {
+        recognitionRef.current.start();
+      } catch {
+        // Ignore "already started" errors
+      }
+    }
+  };
+
+  const loadVoice = () => {
+    const voices = synthesisRef.current.getVoices();
+    voiceParams.current = voices.find(v => v.name.includes('David') || v.name.includes('Google US English')) || null;
+  };
+
+  const speakResponse = (text) => {
+    if (!voiceMode) return;
+    stopSpeaking();
+
+    const speechText = text.replace(/[*#]/g, '');
+    const utterance = new SpeechSynthesisUtterance(speechText);
+
+    if (!voiceParams.current) loadVoice();
+    if (voiceParams.current) utterance.voice = voiceParams.current;
+
+    utterance.onstart = () => setIsSpeaking(true);
+    utterance.onend = () => setIsSpeaking(false);
+    utterance.onerror = () => setIsSpeaking(false);
+
+    synthesisRef.current.speak(utterance);
+  };
+
+  const handleVoiceCommand = (command) => {
+    const lowerCmd = command.toLowerCase().trim();
+    if (['stop', 'cancel', 'wait', 'sleep'].includes(lowerCmd)) {
+      stopSpeaking();
+      setVoiceMode(false);
+      setInput('');
+      return;
+    }
+    setInput(command);
+    handleSend(null, command);
+  };
+
+  // --- Effects ---
+
+  // Initialize Speech Services
+  useEffect(() => {
+    // Recognition
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      const recognition = new SpeechRecognition();
+      recognition.continuous = false;
+      recognition.interimResults = false;
+      recognition.lang = JARVIS_CONFIG.VOICE_LANG;
+
+      recognition.onstart = () => setIsListening(true);
+      recognition.onend = () => setIsListening(false);
+      recognition.onresult = (e) => handleVoiceCommand(e.results[0][0].transcript);
+
+      recognitionRef.current = recognition;
+    }
+
+    // Synthesis Voice Loading
+    if (synthesisRef.current.onvoiceschanged !== undefined) {
+      synthesisRef.current.onvoiceschanged = loadVoice;
+    }
+    loadVoice();
+
+    return () => {
+      recognitionRef.current?.stop();
+      stopSpeaking();
+    };
   }, []);
 
-  // Initialize Chat
+  // Auto-Listen Loop
   useEffect(() => {
-    const savedHistory = safeLoadHistory();
-    if (savedHistory?.length > 0) {
-      setMessages(savedHistory);
+    if (voiceMode && !isSpeaking && !isListening && !isLoading) {
+      const timer = setTimeout(startListening, JARVIS_CONFIG.AUTO_LISTEN_DELAY);
+      return () => clearTimeout(timer);
+    }
+  }, [voiceMode, isSpeaking, isListening, isLoading]);
+
+  // Chat History & Scroll
+  useEffect(() => {
+    const saved = localStorage.getItem('jarvis_history');
+    if (saved) {
+      setMessages(JSON.parse(saved));
     } else {
       setMessages([{
         id: Date.now(),
@@ -76,76 +141,57 @@ const App = () => {
       }]);
     }
     inputRef.current?.focus();
-  }, [safeLoadHistory]);
-
-  // Persist History with limit (last 100 messages)
-  useEffect(() => {
-    if (messages.length > 0) {
-      try {
-        const recentMessages = messages.slice(-100);
-        localStorage.setItem('jarvis_history', JSON.stringify(recentMessages));
-      } catch (error) {
-        console.error('Failed to save chat history:', error);
-      }
-    }
-    scrollToBottom();
-  }, [messages]);
-
-  const scrollToBottom = useCallback(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, []);
 
-  const handleSend = useCallback(async (e) => {
+  useEffect(() => {
+    if (messages.length) {
+      localStorage.setItem('jarvis_history', JSON.stringify(messages));
+      scrollToBottom();
+    }
+  }, [messages]);
+
+  // --- Handlers ---
+  const handleSend = async (e, overrideInput = null) => {
     e?.preventDefault();
-    if (!input.trim() || isLoading) return;
+    const finalInput = overrideInput || input;
+    if (!finalInput.trim() || isLoading) return;
 
-    const userMessage = {
-      id: Date.now(),
-      role: 'user',
-      text: input.trim(),
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    };
+    if (finalInput.toLowerCase() === 'voice mode') {
+      setVoiceMode(true);
+      setInput('');
+      return;
+    }
 
-    setMessages(prev => [...prev, userMessage]);
-    const currentInput = input;
+    // Stop speaking immediately if user interrupts
+    stopSpeaking();
+
+    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const userMsg = { id: Date.now(), role: 'user', text: finalInput.trim(), timestamp };
+
+    setMessages(prev => [...prev, userMsg]);
     setInput('');
     setIsLoading(true);
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), JARVIS_CONFIG.REQUEST_TIMEOUT);
-
-      const response = await fetch(JARVIS_CONFIG.WEBHOOK_URL, {
+      const res = await fetch(JARVIS_CONFIG.WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: currentInput, user_id: userId }),
-        signal: controller.signal,
+        body: JSON.stringify({ message: finalInput, user_id: userId })
       });
 
-      clearTimeout(timeoutId);
+      if (!res.ok) throw new Error('Network error');
 
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const data = await response.json();
-
-      if (!data.reply) {
-        throw new Error('No reply from webhook');
-      }
-
-      const jarvisReply = {
+      const data = await res.json();
+      const replyMsg = {
         id: Date.now() + 1,
         role: 'jarvis',
-        text: data.reply,
+        text: data.reply || "Command executed.",
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
 
-      setMessages(prev => [...prev, jarvisReply]);
-      setStatus('Online');
-    } catch (error) {
-      console.error('Webhook error:', error.message);
-
+      setMessages(prev => [...prev, replyMsg]);
+      speakResponse(replyMsg.text);
+    } catch {
       setMessages(prev => [...prev, {
         id: Date.now() + 1,
         role: 'jarvis',
@@ -153,52 +199,37 @@ const App = () => {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         isError: true
       }]);
-
       setStatus('Offline');
-
-      // Clear previous timeout
-      if (retryTimeoutRef.current) {
-        clearTimeout(retryTimeoutRef.current);
-      }
-
-      // Retry after delay
-      retryTimeoutRef.current = setTimeout(
-        () => setStatus('Online'),
-        JARVIS_CONFIG.RETRY_DELAY
-      );
+      setTimeout(() => setStatus('Online'), 5000);
     } finally {
       setIsLoading(false);
     }
-  }, [input, isLoading, userId]);
+  };
 
-  const clearHistory = useCallback(() => {
-    if (window.confirm("Purge local memory logs?")) {
-      try {
-        localStorage.removeItem('jarvis_history');
-        setMessages([{
-          id: Date.now(),
-          role: 'jarvis',
-          text: "Memory purged. System reset.",
-          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        }]);
-      } catch (error) {
-        console.error('Failed to clear history:', error);
-      }
+  const clearHistory = () => {
+    if (window.confirm("Purge memory logs?")) {
+      localStorage.removeItem('jarvis_history');
+      setMessages([{
+        id: Date.now(),
+        role: 'jarvis',
+        text: "Memory purged. System reset.",
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      }]);
     }
-  }, []);
+  };
 
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (retryTimeoutRef.current) {
-        clearTimeout(retryTimeoutRef.current);
-      }
-    };
-  }, []);
+  const toggleVoice = () => {
+    if (voiceMode) {
+      setVoiceMode(false);
+      stopSpeaking();
+    } else {
+      setVoiceMode(true);
+      startListening();
+    }
+  };
 
   return (
     <div className="flex flex-col h-screen bg-[#05070a] text-slate-300 font-sans selection:bg-cyan-500/30">
-      {/* HUD Header */}
       <header className="flex items-center justify-between px-6 py-4 border-b border-cyan-900/30 bg-[#080b12]/80 backdrop-blur-md">
         <div className="flex items-center gap-3">
           <div className="relative">
@@ -207,58 +238,48 @@ const App = () => {
             </div>
           </div>
           <div>
-            <h1 className="text-sm font-bold tracking-[0.2em] text-cyan-100 uppercase">JARVIS</h1>
-            <p className="text-[10px] text-slate-500 tracking-wider uppercase font-medium">Personal AI Assistant</p>
+            <h1 className="text-xl font-bold tracking-[0.2em] text-cyan-100 font-mono">JARVIS</h1>
+            <p className="text-[10px] text-slate-500 tracking-wider uppercase font-medium font-mono">Personal AI Assistant</p>
           </div>
         </div>
 
         <div className="flex items-center gap-6">
           <div className="hidden md:flex flex-col items-end">
-            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">User ID</span>
-            <span className="text-[11px] text-cyan-400 font-mono">{userId}</span>
+            <span className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">ID: {userId}</span>
           </div>
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-slate-800 bg-slate-900/50">
-            <div className={`w-2 h-2 rounded-full ${status === 'Online' ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-red-500'} animate-pulse`} />
-            <span className="text-[11px] font-bold uppercase tracking-tighter">{status}</span>
+            <div className={`w-2 h-2 rounded-full ${status === 'Online' ? 'bg-cyan-500 shadow-[0_0_8px_#06b6d4]' : 'bg-slate-500'} animate-pulse`} />
+            <span className="text-[11px] font-bold uppercase tracking-tighter font-mono">{status}</span>
           </div>
         </div>
       </header>
 
-      {/* Main Chat Interface */}
       <main className="flex-1 overflow-y-auto px-4 py-8 md:px-24 lg:px-64 custom-scrollbar">
         <div className="max-w-4xl mx-auto space-y-8">
           {messages.map((msg) => (
-            <div 
-              key={msg.id} 
-              className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2 duration-500`}
-            >
+            <div key={msg.id} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'} animate-in fade-in slide-in-from-bottom-2 duration-500`}>
               <div className="flex items-center gap-2 mb-2 px-1">
                 {msg.role === 'jarvis' ? (
                   <>
                     <ShieldCheck className="w-3 h-3 text-cyan-500" />
-                    <span className="text-[10px] uppercase tracking-widest font-black text-cyan-500">System Log</span>
+                    <span className="text-[10px] uppercase tracking-widest font-black text-cyan-500">System</span>
                   </>
                 ) : (
                   <>
-                    <span className="text-[10px] uppercase tracking-widest font-black text-slate-500">Authorized User</span>
+                    <span className="text-[10px] uppercase tracking-widest font-black text-slate-500">User</span>
                     <User className="w-3 h-3 text-slate-500" />
                   </>
                 )}
                 <span className="text-[9px] text-slate-600 font-mono">{msg.timestamp}</span>
               </div>
 
-              <div className={`
-                relative group max-w-[85%] px-5 py-3 rounded-xl border transition-all duration-300
-                ${msg.role === 'user' 
-                  ? 'bg-slate-900/40 border-slate-700/50 text-slate-200' 
-                  : msg.isError 
-                    ? 'bg-red-950/20 border-red-900/40 text-red-300'
-                    : 'bg-[#0a0f18] border-cyan-900/30 text-cyan-50/90 shadow-[inset_0_0_20px_rgba(6,182,212,0.02)]'
-                }
-              `}>
-                <p className="text-sm leading-relaxed tracking-wide font-medium whitespace-pre-wrap">
-                  {msg.text}
-                </p>
+              <div className={`relative group max-w-[85%] px-5 py-3 rounded-xl border transition-all duration-300 ${msg.role === 'user'
+                ? 'bg-slate-900/40 border-slate-700/50 text-slate-200'
+                : msg.isError
+                  ? 'bg-red-950/20 border-red-900/40 text-red-300'
+                  : 'bg-[#0a0f18] border-cyan-900/30 text-cyan-50/90 shadow-[inset_0_0_20px_rgba(6,182,212,0.02)]'
+                }`}>
+                <p className="text-sm leading-relaxed tracking-wide font-medium whitespace-pre-wrap">{msg.text}</p>
                 {msg.role === 'jarvis' && !msg.isError && (
                   <div className="absolute -left-1 top-0 w-[2px] h-full bg-cyan-500/40 rounded-full" />
                 )}
@@ -266,11 +287,37 @@ const App = () => {
             </div>
           ))}
 
+          {voiceMode && (
+            <div className="flex justify-center my-4">
+              <div className={`px-4 py-2 rounded-full border flex items-center gap-3 bg-[#0a0f18] transition-all duration-300 ${isListening ? 'border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]' :
+                isSpeaking ? 'border-cyan-500/50 shadow-[0_0_15px_rgba(6,182,212,0.2)]' : 'border-slate-800'
+                }`}>
+                {isListening ? (
+                  <>
+                    <div className="flex gap-1 h-3 items-center">
+                      <div className="w-1 bg-red-500 h-full animate-[sound-wave_1s_infinite]" />
+                      <div className="w-1 bg-red-500 h-2/3 animate-[sound-wave_1.2s_infinite]" />
+                      <div className="w-1 bg-red-500 h-full animate-[sound-wave_0.8s_infinite]" />
+                    </div>
+                    <span className="text-[10px] uppercase font-bold text-red-400 tracking-wider">Listening</span>
+                  </>
+                ) : isSpeaking ? (
+                  <>
+                    <Activity className="w-4 h-4 text-cyan-400 animate-pulse" />
+                    <span className="text-[10px] uppercase font-bold text-cyan-400 tracking-wider">Speaking</span>
+                  </>
+                ) : (
+                  <span className="text-[10px] uppercase font-bold text-slate-500 tracking-wider">Voice Active</span>
+                )}
+              </div>
+            </div>
+          )}
+
           {isLoading && (
             <div className="flex flex-col items-start animate-pulse">
               <div className="flex items-center gap-2 mb-2 px-1">
                 <Clock className="w-3 h-3 text-cyan-600 animate-spin" />
-                <span className="text-[10px] uppercase tracking-widest font-black text-cyan-600">JARVIS is thinking...</span>
+                <span className="text-[10px] uppercase tracking-widest font-black text-cyan-600">Processing...</span>
               </div>
               <div className="h-10 w-24 bg-cyan-950/20 border border-cyan-900/30 rounded-xl" />
             </div>
@@ -279,46 +326,55 @@ const App = () => {
         </div>
       </main>
 
-      {/* Input Section */}
       <footer className="p-4 md:p-8 bg-gradient-to-t from-[#05070a] via-[#05070a] to-transparent">
         <div className="max-w-3xl mx-auto">
-          <form 
-            onSubmit={handleSend}
-            className="relative flex items-center group"
-          >
-            <div className="absolute left-4 text-cyan-600 group-focus-within:text-cyan-400 transition-colors pointer-events-none">
-              <Terminal className="w-5 h-5" />
+          <form onSubmit={handleSend} className="relative flex items-center group gap-2">
+            <div className="relative flex-1 group/input">
+              <div className="absolute left-4 top-1/2 -translate-y-1/2 text-cyan-600 group-focus-within/input:text-cyan-400 transition-colors pointer-events-none">
+                <Terminal className="w-5 h-5" />
+              </div>
+              <input
+                ref={inputRef}
+                type="text"
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={isLoading ? "Processing..." : "Execute command..."}
+                disabled={isLoading}
+                className={`
+                  w-full bg-[#0d121d]/80 border border-slate-800 rounded-2xl py-4 pl-12 pr-12 
+                  text-sm tracking-wide text-slate-100 placeholder:text-slate-600 font-mono
+                  focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20
+                  transition-all duration-300 shadow-2xl
+                  ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:border-slate-700'}
+                `}
+              />
             </div>
-            
-            <input
-              ref={inputRef}
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={isLoading ? "Processing sequence..." : "Execute command (e.g., 'plan my day')..."}
-              disabled={isLoading}
-              aria-label="Message input"
-              className={`
-                w-full bg-[#0d121d]/80 border border-slate-800 rounded-2xl py-4 pl-12 pr-16 
-                text-sm tracking-wide text-slate-100 placeholder:text-slate-600
-                focus:outline-none focus:border-cyan-500/50 focus:ring-1 focus:ring-cyan-500/20
-                transition-all duration-300 shadow-2xl
-                ${isLoading ? 'opacity-50 cursor-not-allowed' : 'hover:border-slate-700'}
-              `}
-            />
+
+            <button
+              type="button"
+              onClick={toggleVoice}
+              className={`p-4 rounded-xl border transition-all duration-300 group/mic ${voiceMode
+                ? 'bg-red-500/10 border-red-500/50 text-red-400 animate-pulse'
+                : 'bg-slate-800/50 border-slate-700/50 text-slate-400 hover:text-cyan-400 hover:border-cyan-500/30'
+                }`}
+              title={voiceMode ? "Stop Auto-Listen" : "Start Auto-Listen Loop"}
+            >
+              {voiceMode ? (
+                <StopCircle className="w-5 h-5" />
+              ) : (
+                <Mic className="w-5 h-5 group-hover/mic:scale-110 transition-transform" />
+              )}
+            </button>
 
             <button
               type="submit"
               disabled={!input.trim() || isLoading}
-              aria-label="Send message"
-              className={`
-                absolute right-3 p-2.5 rounded-xl transition-all duration-300
-                ${input.trim() && !isLoading 
-                  ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(8,145,178,0.4)] hover:bg-cyan-500' 
-                  : 'bg-slate-800 text-slate-500 cursor-not-allowed'}
-              `}
+              className={`p-4 rounded-xl transition-all duration-300 ${input.trim() && !isLoading
+                ? 'bg-cyan-600 text-white shadow-[0_0_15px_rgba(8,145,178,0.4)] hover:bg-cyan-500'
+                : 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                }`}
             >
-              <Send className="w-4 h-4" />
+              <Send className="w-5 h-5" />
             </button>
           </form>
 
@@ -327,9 +383,8 @@ const App = () => {
               <span className="text-[9px] text-slate-600 uppercase tracking-widest font-bold">Protocol: Secure_v2.4</span>
               <span className="text-[9px] text-slate-600 uppercase tracking-widest font-bold">Enc: AES-256</span>
             </div>
-            <button 
+            <button
               onClick={clearHistory}
-              aria-label="Clear chat history"
               className="flex items-center gap-1.5 text-[9px] text-slate-600 uppercase tracking-widest font-bold hover:text-cyan-500 transition-colors"
             >
               <RefreshCcw className="w-2.5 h-2.5" />
@@ -338,15 +393,9 @@ const App = () => {
           </div>
         </div>
       </footer>
+
     </div>
   );
 };
 
-// Export wrapped component
-export default function WrappedApp() {
-  return (
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  );
-}
+export default App;
