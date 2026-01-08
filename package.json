@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "mock-server": "node mock-server.js"
+    "server": "node voice-server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -19,6 +19,7 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
     "user-agents": "^1.1.669"
   },
   "devDependencies": {
